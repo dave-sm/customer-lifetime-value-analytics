@@ -1,0 +1,283 @@
+================================================================================
+CLV DASHBOARDS - DAX MEASURE REFERENCE
+================================================================================
+Project : Customer Lifetime Value (CLV) Analytics for E-Commerce Retail.
+Source  : fact_transactions, dimension_customers, dimension_date
+================================================================================
+
+--------------------------------------------------------------------------------
+SECTION 1 - REVENUE & TRANSACTION MEASURES (fact_transactions)
+--------------------------------------------------------------------------------
+
+-- total_revenue
+-- Total transaction revenue across all cleaned invoice lines.
+-- Source of truth for revenue everywhere in the report.
+total_revenue = SUM(fact_transactions[TotalPrice])
+-- Format: Currency (£), 2 decimals.
+
+-- total_orders
+-- Count of unique invoices. Distinct because a single invoice contains
+-- multiple line items (stock codes).
+total_orders = DISTINCTCOUNT(fact_transactions[Invoice])
+-- Format: Whole number, thousands separator.
+
+-- total_items
+-- Total quantity of items sold across all transactions.
+total_items = SUM(fact_transactions[Quantity])
+-- Format: Whole number, thousands separator.
+
+-- ave_order_value
+-- Average revenue per order. Derived, not averaged column.
+-- DIVIDE() used for safe division (returns BLANK on /0).
+ave_order_value = DIVIDE([total_revenue], [total_orders])
+-- Format: Currency (£), 2 decimals.
+
+-- revenue_per_item
+-- Average revenue per item sold.
+revenue_per_item = DIVIDE([total_revenue], [total_items])
+-- Format: Currency (£), 2 decimals.
+
+
+--------------------------------------------------------------------------------
+SECTION 2 - CUSTOMER COUNT MEASURES (dimension_customers)
+--------------------------------------------------------------------------------
+
+-- total_customers
+-- Distinct customers. Defined against fact_transactions so it responds to
+-- date slicers (customers active within filter context), not all 5,840 rows.
+total_customers = DISTINCTCOUNT(fact_transactions[CustomerID])
+-- Format: Whole number.
+
+-- active_customers
+-- Customers with a purchase in the last 90 days at snapshot.
+-- RecencyDays is measured from the reference date (2011-12-10).
+active_customers =
+    CALCULATE(
+        DISTINCTCOUNT(dimension_customers[CustomerID]),
+        FILTER(
+            dimension_customers,
+            dimension_customers[RecencyDays] <= 90
+        )
+    )
+-- Format: Whole number.
+
+
+--------------------------------------------------------------------------------
+SECTION 3 - CLV MEASURES (dimension_customers)
+--------------------------------------------------------------------------------
+
+-- ave_clv_12m
+-- Mean 12-month probabilistic CLV (BG/NBD + Gamma-Gamma).
+-- HEAVY RIGHT SKEW - always pair with median_clv_12m on the page.
+ave_clv_12m = AVERAGE(dimension_customers[clv_12m])
+-- Format: Currency (£), 2 decimals.
+
+-- median_clv_12m
+-- Median 12-month probabilistic CLV. Robust to the long right tail.
+-- Preferred headline number when describing the "typical" customer.
+median_clv_12m = MEDIAN(dimension_customers[clv_12m])
+-- Format: Currency (£), 2 decimals.
+
+-- ave_clv_6m_pred
+-- Mean 6-month ML-predicted CLV (Random Forest).
+ave_clv_6m_pred = AVERAGE(dimension_customers[clv_6m_pred])
+-- Format: Currency (£), 2 decimals.
+
+-- total_clv_12m
+-- Sum of 12-month CLV across customers in filter context.
+total_clv_12m = SUM(dimension_customers[clv_12m])
+-- Format: Currency (£), thousands separator.
+
+-- total_clv_6m_pred
+-- Sum of 6-month ML-predicted CLV across customers in filter context.
+total_clv_6m_pred = SUM(dimension_customers[clv_6m_pred])
+-- Format: Currency (£), thousands separator.
+
+
+--------------------------------------------------------------------------------
+SECTION 4 - RFM AVERAGES (dimension_customers)
+--------------------------------------------------------------------------------
+-- Descriptive averages used on the Segmentation and drill-through pages.
+-- Renamed with underscore prefix for consistency across visuals.
+
+ave_recency_days = AVERAGE(dimension_customers[RecencyDays])
+ave_frequency     = AVERAGE(dimension_customers[Frequency])
+ave_monetary     = AVERAGE(dimension_customers[Monetary])
+-- Format: Whole number (Recency, Frequency); Currency (Monetary).
+
+--------------------------------------------------------------------------------
+SECTION 5 - TARGETING & UPLIFT MEASURES
+--------------------------------------------------------------------------------
+
+-- customer_rank_clv_6m_pred
+-- Dense-descending rank of a customer by 6-month predicted CLV.
+-- BLANK-safe: customers with no ML prediction (post-cutoff) are excluded
+-- from the ranking scope via FILTER(ALL(...), NOT ISBLANK(...)).
+customer_rank_clv_6m_pred =
+    VAR clv = MAX(dimension_customers[clv_6m_pred])
+    RETURN
+        IF(
+            ISBLANK(clv),
+            BLANK(),
+            RANKX(
+                FILTER(
+                    ALL(dimension_customers),
+                    NOT ISBLANK(dimension_customers[clv_6m_pred])
+                ),
+                CALCULATE(MAX(dimension_customers[clv_6m_pred])),
+                ,
+                DESC,
+                Dense
+            )
+        )
+-- Format: Whole number.
+
+-- selected_customers
+-- Number of customers in the targeted "top X%" cohort.
+-- Driven by the TopPct parameter table (0.01, 0.05, 0.10, 0.20).
+-- Defaults to 10% when no selection is made.
+selected_customers =
+    VAR pct = SELECTEDVALUE(TopPct[TopPct], 0.10)
+    VAR total_customers =
+        CALCULATE(
+            DISTINCTCOUNT(dimension_customers[CustomerID]),
+            ALL(dimension_customers)
+        )
+    RETURN INT(total_customers * pct)
+-- Format: Whole number.
+
+-- revenue_captured_TopPct
+-- Revenue attributable to the top X% of customers by predicted 6m CLV.
+revenue_captured_TopPct =
+    VAR n = [selected_customers]
+    RETURN
+        CALCULATE(
+            [total_revenue],
+            FILTER(
+                ALL(dimension_customers[CustomerID]),
+                [customer_rank_clv_6m_pred] <= n
+            )
+        )
+-- Format: Currency (£), thousands separator.
+
+-- revenue_captured_pct
+-- Share of total revenue captured by the top X% cohort.
+-- Denominator uses ALL(dimension_customers) to ignore page slicers.
+revenue_captured_pct =
+    DIVIDE(
+        [revenue_captured_TopPct],
+        CALCULATE([total_revenue], ALL(dimension_customers))
+    )
+-- Format: Percentage, 1 decimal.
+
+-- include_in_target_list
+-- Binary flag for the targeting table. 1 = customer is in the top X% cohort.
+include_in_target_list =
+    VAR rank_ = [customer_rank_clv_6m_pred]
+    VAR cutoff = [selected_customers]
+    RETURN
+        IF(
+            NOT ISBLANK(rank_) && rank_ <= cutoff,
+            1,
+            0
+        )
+-- Format: Whole number (0 or 1).
+
+
+--------------------------------------------------------------------------------
+SECTION 6 - AUXILIARY MEASURES
+--------------------------------------------------------------------------------
+
+-- customer_country(most_common)
+-- Modal country for a selected customer. Used on the drill-through page.
+customer_country(most_common) =
+    VAR cust = SELECTEDVALUE(dimension_customers[CustomerID])
+    RETURN
+        CALCULATE(
+            MAXX(
+                TOPN(
+                    1,
+                    SUMMARIZE(
+                        FILTER(
+                            fact_transactions,
+                            fact_transactions[CustomerID] = cust
+                        ),
+                        fact_transactions[Country],
+                        "TxnCount", COUNTROWS(fact_transactions)
+                    ),
+                    [TxnCount], DESC,
+                    fact_transactions[Country], ASC
+                ),
+                fact_transactions[Country]
+            )
+        )
+-- Format: Text.
+
+-- revenue_value  (revenue_comparisons table)
+-- Field-parameter style measure that switches between two revenue views
+-- for side-by-side comparison on the Targeting page.
+revenue_value =
+    SWITCH(
+        SELECTEDVALUE('revenue_comparisons'[Metric]),
+        "Revenue Captured (top %)", [revenue_captured_TopPct],
+        "Total Revenue",            [total_revenue]
+    )
+-- Format: Currency (£), thousands separator.
+
+-- random_baseline  (uplift_simulation table)
+-- The x-axis baseline (cumulative customer %) for the uplift curve.
+random_baseline = SELECTEDVALUE(uplift_simulation[customers_pct])
+-- Format: Percentage, 1 decimal.
+
+
+--------------------------------------------------------------------------------
+SECTION 7 - CALCULATED COLUMNS (not measures, but referenced above)
+--------------------------------------------------------------------------------
+
+-- dimension_customers[recency_bands]
+-- Bucketed RecencyDays for the Retention & Recency page.
+recency_bands =
+    SWITCH(
+        TRUE(),
+        dimension_customers[RecencyDays] <= 30,  "0-30 days",
+        dimension_customers[RecencyDays] <= 60,  "31-60 days",
+        dimension_customers[RecencyDays] <= 90,  "61-90 days",
+        dimension_customers[RecencyDays] <= 180, "91-180 days",
+        "180+ days"
+    )
+
+-- dimension_customers[cluster_label]
+-- Names for the K-Means cluster IDs.
+cluster_label =
+    SWITCH(
+        dimension_customers[Cluster],
+        0, "Core Customers",
+        1, "Low-Value / Dormant",
+        2, "Bulk / Business Buyers",
+        3, "VIP / Whales",
+        "Unclassified"
+    )
+
+-- dimension_customers[clv_12m (bins)]
+-- Power BI auto-generated bin column. Bin size: £6,737.30.
+-- Skips BLANK to avoid a spurious zero bucket for one-time buyers.
+
+-- dimension_customers[clv_6m_pred (bins)]
+-- Power BI auto-generated bin column. Bin size: £2,853.98.
+-- Skips BLANK to avoid a spurious zero bucket for post-cutoff customers.
+
+
+================================================================================
+NOTES & CONVENTIONS
+================================================================================
+1. All currency measures are in GBP (£) - the source dataset's native
+   currency (UK online retail).
+2. DIVIDE() is used everywhere a ratio is computed. The use of `/` produces 
+   errors on zero denominators instead of BLANK.
+3. Time intelligence (YTD, MoM, rolling averages) is not used. The dataset
+   is a fixed 24-month window; trend visuals are rolling comparisons, not
+   time-intelligence measures.
+4. Coverage gaps (1,669 nulls in clv_12m; 908 nulls in clv_6m_pred) are
+   structural. Nulls should not be replaced with zero, that will distort every
+   average and total on the report.
+================================================================================

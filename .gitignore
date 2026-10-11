@@ -1,0 +1,18 @@
+# Virtual Environment
+.venv/
+
+# Python cache and temporary files and streamlit
+__pycache__/
+*.py[cod]
+*$py.class
+pycache/
+*.pyc
+.streamlit/secrets.toml
+.DS_Store
+
+# Jupyter notebook checkpoints
+.ipynb_chechpoints/
+
+# Power BI Interactive file
+power-bi/retail_clv.pbix
+README.md
